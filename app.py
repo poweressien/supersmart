@@ -56,13 +56,14 @@ STOP_WORDS = {
     "the", "this", "that", "search", "results", "page", "website", "about",
     "contact", "support", "home", "login", "sign", "up", "news", "business",
     "company", "site", "official", "welcome", "help", "services", "products",
-    "pricing", "profile", "company", "directory", "find", "people", "team" 
+    "pricing", "profile", "directory", "find", "people", "team", "solutions",
+    "platform", "media", "blog", "newsroom"
 }
 
 GENERIC_TITLE_TOKENS = {
     "home", "homepage", "index", "login", "sign in", "contact us", "contact",
     "support", "help", "faq", "about us", "about", "services", "products",
-    "pricing", "news", "blog", "search", "results"
+    "pricing", "news", "blog", "search", "results", "directory"
 }
 
 
@@ -86,6 +87,22 @@ def is_person_like_name(value: str) -> bool:
     return False
 
 
+def looks_like_company(value: str) -> bool:
+    text = normalize_whitespace(value).lower()
+    if not text:
+        return False
+    company_markers = [
+        "inc", "ltd", "llc", "corp", "group", "company", "co.", "co ", "holdings",
+        "partners", "systems", "solutions", "technologies", "labs", "studio", "agency",
+        "network", "consulting", "capital",
+    ]
+    if any(marker in text for marker in company_markers):
+        return True
+    if re.search(r"\b(?:[A-Z][a-z]+\s+){1,3}(?:Inc|LLC|Ltd|Corp|Group|Co)\b", value):
+        return True
+    return False
+
+
 def detect_type(raw: str) -> str:
     value = normalize_whitespace(raw)
     if not value:
@@ -102,9 +119,26 @@ def detect_type(raw: str) -> str:
         return "username"
     if value.isdigit() and len(value) >= 4:
         return "number"
-    if is_person_like_name(value) or value.count(" ") >= 1:
+    if is_person_like_name(value):
+        return "person_or_company"
+    if looks_like_company(value):
+        return "person_or_company"
+    if value.count(" ") >= 1:
         return "person_or_company"
     return "keyword"
+
+
+def classify_query_label(query: str, kind: str) -> str:
+    value = normalize_whitespace(query)
+    if kind in ["email", "phone", "domain", "url", "number", "username"]:
+        return kind
+    if is_person_like_name(value):
+        return "person"
+    if looks_like_company(value):
+        return "company"
+    if value.count(" ") >= 2:
+        return "company"
+    return "entity"
 
 
 def clean_email(raw: str) -> str:
@@ -266,6 +300,15 @@ def safe_domain_root(domain: str) -> str:
     return root.strip("-")
 
 
+def compact_title(title: str) -> str:
+    value = strip_generic_title(title)
+    if not value:
+        return ""
+    value = re.sub(r"[-–|:—].*$", "", value).strip()
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
 def score_title_match(title: str, query: str) -> int:
     text = normalize_whitespace(title).lower()
     q = normalize_whitespace(query).lower()
@@ -280,6 +323,35 @@ def score_title_match(title: str, query: str) -> int:
     return score
 
 
+def explain_result(item: Dict[str, Any], query: str) -> List[str]:
+    reasons: List[str] = []
+    title = (item.get("title") or "").lower()
+    snippet = (item.get("snippet") or "").lower()
+    domain = (item.get("domain") or "").lower()
+    source = (item.get("source") or "general").lower()
+    q = normalize_whitespace(query).lower()
+
+    if q and q in (title + " " + snippet):
+        reasons.append("exact match")
+    if q and q in title:
+        reasons.append("title overlap")
+    if q and q in domain:
+        reasons.append("domain match")
+    if "linkedin" in domain or "edu" in domain or "gov" in domain or "org" in domain:
+        reasons.append("high-trust domain")
+    if source in {"linkedin", "institution"}:
+        reasons.append("strong source trust")
+    if any(token in title for token in ["contact", "support", "sales", "customer", "help", "pricing"]):
+        reasons.append("contact signal")
+    if item.get("score", 0) >= 80:
+        reasons.append("strong relevance")
+    if item.get("score", 0) < 25:
+        reasons.append("weak match")
+    if not reasons:
+        reasons.append("public reference")
+    return reasons[:5]
+
+
 def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
     title = (item.get("title") or "").strip()
     snippet = (item.get("snippet") or "").strip()
@@ -290,7 +362,6 @@ def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
     base_score = 0
     source_weight = get_source_weight(domain)
 
-    # Query-related evidence
     if q and q in text:
         base_score += 30
     if q and q in title.lower():
@@ -298,7 +369,6 @@ def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
     if q and q in domain.lower():
         base_score += 18
 
-    # Token overlap
     tokens = query_tokens(q)
     if tokens:
         title_hits = sum(1 for token in tokens if token in title.lower())
@@ -306,7 +376,6 @@ def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
         domain_hits = sum(1 for token in tokens if token in domain.lower())
         base_score += title_hits * 10 + snippet_hits * 7 + domain_hits * 5
 
-    # Domain and source confidence
     if domain:
         base_score += 10
     if "linkedin.com" in domain:
@@ -315,10 +384,9 @@ def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
         base_score += 12
     if "google" in domain:
         base_score += 4
-    if any(token in d for d in [domain.lower()] for token in ["gov", "edu", "org"]):
+    if any(token in domain for token in ["gov", "edu", "org"]):
         base_score += 8
 
-    # Content quality
     if any(k in text for k in ["support", "contact", "customer", "sales", "pricing", "business", "company", "account", "invoice"]):
         base_score += 8
     if any(k in title.lower() for k in ["contact", "support", "sales", "help", "customer", "pricing", "official"]):
@@ -328,17 +396,15 @@ def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
     if snippet:
         base_score += 4
 
-    # Reduce generic home/login pages unless query is explicitly a page or site
-    clean_title = strip_generic_title(title)
+    clean_title = compact_title(title)
     if not clean_title and ("home" in title.lower() or "login" in title.lower() or "support" in title.lower()):
         base_score -= 12
 
-    # Query-specific penalties
     if q and any(phrase in text for phrase in ["login", "sign in", "register", "download pdf"]):
         base_score -= 10
 
     score = int(base_score * source_weight)
-    return {
+    item_record = {
         "title": title,
         "link": link,
         "snippet": snippet,
@@ -348,10 +414,27 @@ def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
         "entity_names": extract_entity_names(f"{title} {snippet}"),
         "owner_hint": safe_domain_root(domain),
     }
+    item_record["reasons"] = explain_result(item_record, query)
+    return item_record
+
+
+def dedupe_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    unique: List[Dict[str, Any]] = []
+    seen = set()
+    for item in results:
+        title = compact_title(item.get("title", ""))
+        link = item.get("link", "")
+        domain = extract_domain_from_link(link)
+        key = (title.lower(), link.lower(), domain.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
 
 
 def prepare_ranked_results(results: List[Dict[str, str]], query: str) -> List[Dict[str, Any]]:
-    ranked = [rank_result(item, query) for item in results]
+    ranked = [rank_result(item, query) for item in dedupe_results(results)]
     ranked = [item for item in ranked if item.get("title") or item.get("link") or item.get("snippet")]
     ranked.sort(key=lambda x: x.get("score", 0), reverse=True)
     return ranked
@@ -402,7 +485,7 @@ def serpapi_search(query: str, limit: int = 8) -> List[Dict[str, str]]:
         snippet = item.get("snippet") or ""
         if title or link or snippet:
             results.append({"title": title, "link": link, "snippet": snippet})
-    return results
+    return dedupe_results(results)
 
 
 def google_cse_search(query: str, limit: int = 8) -> List[Dict[str, str]]:
@@ -419,7 +502,7 @@ def google_cse_search(query: str, limit: int = 8) -> List[Dict[str, str]]:
         snippet = item.get("snippet") or ""
         if title or link or snippet:
             results.append({"title": title, "link": link, "snippet": snippet})
-    return results
+    return dedupe_results(results)
 
 
 def duckduckgo_search(query: str, limit: int = 8) -> List[Dict[str, str]]:
@@ -433,7 +516,7 @@ def duckduckgo_search(query: str, limit: int = 8) -> List[Dict[str, str]]:
                 snippet = item.get("body") or ""
                 if title or link or snippet:
                     results.append({"title": title, "link": link, "snippet": snippet})
-            return results
+            return dedupe_results(results)
     except Exception:
         return []
 
@@ -453,8 +536,7 @@ def build_search_queries(query: str, kind: str) -> List[str]:
         base_queries = [f'"{domain}"', f"{domain}", f'"{domain}" "company"', f'"{domain}" "contact"', f'"{domain}" "site:linkedin.com"']
     elif kind == "email":
         email = clean_email(q)
-        local = email.split("@")[0]
-        domain_part = email.split("@")[-1]
+        local, domain_part = email.split("@", 1)
         base_queries = [f'"{email}"', f"{email}", f'"{local}" "{domain_part}"', f'"{email}" "contact"', f'"{email}" "support"']
     elif kind == "url":
         url = clean_url(q)
@@ -482,18 +564,17 @@ def search_all(query: str, kind: str = "all", limit: int = 10, aggressive: bool 
                 if key not in seen and item.get("link"):
                     seen.add(key)
                     results.append(item)
-    return results[: max(limit * 3, 25) if aggressive else limit * 3]
+    return dedupe_results(results)[: max(limit * 3, 25) if aggressive else limit * 3]
 
 
 def guess_owner(results: List[Dict[str, str]]) -> List[str]:
     owners = []
     seen = set()
     for item in results:
-        title = (item.get("title") or "").strip()
-        cleaned = strip_generic_title(title)
-        if not cleaned:
+        title = compact_title(item.get("title", ""))
+        if not title:
             continue
-        cleaned = re.sub(r"[-–|:—].*$", "", cleaned).strip()
+        cleaned = re.sub(r"[-–|:—].*$", "", title).strip()
         cleaned = re.sub(r"\s+", " ", cleaned)
         if cleaned and len(cleaned) > 2 and cleaned not in seen:
             owners.append(cleaned)
@@ -821,6 +902,7 @@ def build_intelligence_profile(query: str, kind: str, results: List[Dict[str, An
     average_score = sum(item.get("score", 0) for item in results) / max(len(results), 1)
     confidence_label = "high" if score_value >= 80 and len(results) >= 4 else "medium" if score_value >= 40 and len(results) >= 2 else "low"
 
+    entity_type = classify_query_label(query, kind)
     likely_name = deduped[0] if deduped else query
     likely_company = deduped[1] if len(deduped) > 1 else likely_name
 
@@ -835,13 +917,14 @@ def build_intelligence_profile(query: str, kind: str, results: List[Dict[str, An
         "top_domains": [d for d, _ in top_domains],
         "source_distribution": source_counts,
         "query_type": kind,
+        "entity_category": entity_type,
         "likely_name": likely_name,
         "likely_company": likely_company,
         "likely_use_case": likely_usage[0] if likely_usage else "Unknown",
         "confidence": confidence_label,
         "average_score": round(average_score, 1),
         "notes": [
-            "Public search signals suggest the strongest matches are from trusted domains and relevant source types.",
+            "Public signals suggest the strongest matches are from trusted domains and relevant source types.",
             "The model prioritizes domains with stronger credibility, title overlap, and content relevance.",
         ],
         "narrative": narrative,
@@ -953,7 +1036,6 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
     else:
         confidence = "low"
     result["summary"]["confidence"] = confidence
-    result["summary"]["narrative"] = result["summary"].get("narrative", "")
     return result
 
 
@@ -964,6 +1046,7 @@ def render_mobile_css() -> None:
         .stApp { padding-bottom: 2rem; }
         div[data-testid="stSidebar"] { background: #0f172a; }
         .result-card { border:1px solid #2d3b53; border-radius:14px; padding:14px 16px; margin-bottom:12px; background:linear-gradient(180deg,#111827,#0f172a); box-shadow:0 2px 10px rgba(15,23,4,0.18); }
+        .result-chip { display:inline-block; padding:4px 8px; border-radius:999px; margin:4px 6px 0 0; font-size:11px; background:#1e293b; color:#dbeafe; }
         @media (max-width: 768px) {
             .block-container { padding: 0.8rem 0.75rem 1.5rem !important; }
             h1 { font-size: 2rem !important; }
@@ -1008,6 +1091,8 @@ def render_result_card(item: Dict[str, Any]) -> None:
     domain = item.get("domain", "")
     score = item.get("score", 0)
     entity_names = item.get("entity_names", [])
+    reasons = item.get("reasons", [])
+    chips = "".join(f'<span class="result-chip">{reason}</span>' for reason in reasons)
     with st.container():
         st.markdown(
             f"""
@@ -1018,6 +1103,7 @@ def render_result_card(item: Dict[str, Any]) -> None:
                 </div>
                 <div style="font-size:20px; font-weight:600; margin-bottom:8px;"><a href="{link}" target="_blank" style="color:#f8fafc; text-decoration:none;">{title}</a></div>
                 <div style="font-size:13px; color:#cbd5e1; margin-bottom:8px;">entity hints: {', '.join(entity_names) if entity_names else 'n/a'}</div>
+                <div style="margin-bottom:8px;">{chips}</div>
                 <div style="font-size:14px; color:#dbeafe; line-height:1.6;">{snippet}</div>
             </div>
             """,
@@ -1045,6 +1131,9 @@ def render_intelligence_profile(data: Dict[str, Any]) -> None:
         st.code(profile.get("likely_use_case", "Unknown"))
         st.markdown("**Confidence**")
         st.code(str(profile.get("confidence", "low")).title())
+
+    st.markdown("**Entity category**")
+    st.code(profile.get("entity_category", "entity"))
 
     st.markdown("**Top entities**")
     st.code(", ".join(profile.get("top_entities", [])) if profile.get("top_entities") else "No meaningful entities found.")
@@ -1118,6 +1207,7 @@ def render_downloads(data: Dict[str, Any], input_value: str) -> None:
             "domain": item.get("domain", ""),
             "score": item.get("score", 0),
             "source": item.get("source", ""),
+            "reasons": ", ".join(item.get("reasons", [])),
         })
     df = pd.DataFrame(csv_lines)
     csv_bytes = df.to_csv(index=False).encode("utf-8")
