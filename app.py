@@ -36,7 +36,6 @@ def get_secret(name: str, default: str = "") -> str:
         return str(value).strip()
     return default
 
-
 SERPAPI_KEY = get_secret("SERPAPI_API_KEY")
 GOOGLE_CSE_KEY = get_secret("GOOGLE_CSE_KEY")
 GOOGLE_CSE_CX = get_secret("GOOGLE_CSE_CX")
@@ -45,9 +44,9 @@ NUMVERIFY_KEY = get_secret("NUMVERIFY_API_KEY")
 st.set_page_config(page_title="Entity Intelligence", page_icon="🔎", layout="wide")
 
 SOURCE_WEIGHTS = {
-    "linkedin": 1.5,
+    "linkedin": 1.55,
     "social": 1.25,
-    "institution": 1.35,
+    "institution": 1.4,
     "search": 1.12,
     "general": 0.9,
 }
@@ -57,7 +56,7 @@ STOP_WORDS = {
     "contact", "support", "home", "login", "sign", "up", "news", "business",
     "company", "site", "official", "welcome", "help", "services", "products",
     "pricing", "profile", "directory", "find", "people", "team", "solutions",
-    "platform", "media", "blog", "newsroom"
+    "platform", "media", "blog", "newsroom", "research", "portal"
 }
 
 GENERIC_TITLE_TOKENS = {
@@ -94,13 +93,26 @@ def looks_like_company(value: str) -> bool:
     company_markers = [
         "inc", "ltd", "llc", "corp", "group", "company", "co.", "co ", "holdings",
         "partners", "systems", "solutions", "technologies", "labs", "studio", "agency",
-        "network", "consulting", "capital",
+        "network", "consulting", "capital", "foundation", "association", "university"
     ]
     if any(marker in text for marker in company_markers):
         return True
-    if re.search(r"\b(?:[A-Z][a-z]+\s+){1,3}(?:Inc|LLC|Ltd|Corp|Group|Co)\b", value):
+    if re.search(r"\b(?:[A-Z][a-z]+\s+){1,3}(?:Inc|LLC|Ltd|Corp|Group|Co|Holding)\b", value):
         return True
     return False
+
+
+def classify_query_label(query: str, kind: str) -> str:
+    value = normalize_whitespace(query)
+    if kind in ["email", "phone", "domain", "url", "number", "username"]:
+        return kind
+    if is_person_like_name(value):
+        return "person"
+    if looks_like_company(value):
+        return "company"
+    if value.count(" ") >= 2:
+        return "company"
+    return "entity"
 
 
 def detect_type(raw: str) -> str:
@@ -126,19 +138,6 @@ def detect_type(raw: str) -> str:
     if value.count(" ") >= 1:
         return "person_or_company"
     return "keyword"
-
-
-def classify_query_label(query: str, kind: str) -> str:
-    value = normalize_whitespace(query)
-    if kind in ["email", "phone", "domain", "url", "number", "username"]:
-        return kind
-    if is_person_like_name(value):
-        return "person"
-    if looks_like_company(value):
-        return "company"
-    if value.count(" ") >= 2:
-        return "company"
-    return "entity"
 
 
 def clean_email(raw: str) -> str:
@@ -266,6 +265,15 @@ def strip_generic_title(title: str) -> str:
     return value
 
 
+def compact_title(title: str) -> str:
+    value = strip_generic_title(title)
+    if not value:
+        return ""
+    value = re.sub(r"[-–|:—].*$", "", value).strip()
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
 def extract_entity_names(text: str) -> List[str]:
     cleaned = re.sub(r"https?://\S+", " ", text)
     cleaned = re.sub(r"\b(?:www\.|com|net|org|io|co|gov|edu)\b", " ", cleaned, flags=re.I)
@@ -300,15 +308,6 @@ def safe_domain_root(domain: str) -> str:
     return root.strip("-")
 
 
-def compact_title(title: str) -> str:
-    value = strip_generic_title(title)
-    if not value:
-        return ""
-    value = re.sub(r"[-–|:—].*$", "", value).strip()
-    value = re.sub(r"\s+", " ", value)
-    return value
-
-
 def score_title_match(title: str, query: str) -> int:
     text = normalize_whitespace(title).lower()
     q = normalize_whitespace(query).lower()
@@ -337,11 +336,11 @@ def explain_result(item: Dict[str, Any], query: str) -> List[str]:
         reasons.append("title overlap")
     if q and q in domain:
         reasons.append("domain match")
-    if "linkedin" in domain or "edu" in domain or "gov" in domain or "org" in domain:
+    if any(token in domain for token in ["linkedin", "edu", "gov", "org"]):
         reasons.append("high-trust domain")
     if source in {"linkedin", "institution"}:
         reasons.append("strong source trust")
-    if any(token in title for token in ["contact", "support", "sales", "customer", "help", "pricing"]):
+    if any(token in title for token in ["contact", "support", "sales", "customer", "help", "pricing", "about", "team"]):
         reasons.append("contact signal")
     if item.get("score", 0) >= 80:
         reasons.append("strong relevance")
@@ -389,7 +388,7 @@ def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
 
     if any(k in text for k in ["support", "contact", "customer", "sales", "pricing", "business", "company", "account", "invoice"]):
         base_score += 8
-    if any(k in title.lower() for k in ["contact", "support", "sales", "help", "customer", "pricing", "official"]):
+    if any(k in title.lower() for k in ["contact", "support", "sales", "help", "customer", "pricing", "official", "team"]):
         base_score += 10
     if title:
         base_score += 6
@@ -402,6 +401,14 @@ def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
 
     if q and any(phrase in text for phrase in ["login", "sign in", "register", "download pdf"]):
         base_score -= 10
+
+    # Public-source extraction signals
+    if "email" in title.lower() or "email" in snippet.lower():
+        base_score += 12
+    if "contact" in title.lower() and "page" in title.lower():
+        base_score += 7
+    if "linkedin" in domain:
+        base_score += 11
 
     score = int(base_score * source_weight)
     item_record = {
@@ -527,22 +534,22 @@ def build_search_queries(query: str, kind: str) -> List[str]:
     base_queries = [f'"{cleaned}"', f"{cleaned}", f'"{cleaned}" "contact"', f'"{cleaned}" "support"', f'"{cleaned}" "company"']
     if kind == "phone":
         digits = re.sub(r"\D", "", q)
-        base_queries = [f'"{digits}"', f"{digits}", f'"{digits}" "phone"', f'"{digits}" "business"', f'"{digits}" "support"']
+        base_queries = [f'"{digits}"', f"{digits}", f'"{digits}" "phone"', f'"{digits}" "business"', f'"{digits}" "support"', f'"{digits}" "sales"']
     elif kind == "number":
         digits = re.sub(r"\D", "", q)
-        base_queries = [f'"{digits}"', f"{digits}", f'"{digits}" "reference"', f'"{digits}" "invoice"', f'"{digits}" "account"']
+        base_queries = [f'"{digits}"', f"{digits}", f'"{digits}" "reference"', f'"{digits}" "invoice"', f'"{digits}" "account"', f'"{digits}" "customer"']
     elif kind == "domain":
         domain = clean_domain(q)
-        base_queries = [f'"{domain}"', f"{domain}", f'"{domain}" "company"', f'"{domain}" "contact"', f'"{domain}" "site:linkedin.com"']
+        base_queries = [f'"{domain}"', f"{domain}", f'"{domain}" "company"', f'"{domain}" "contact"', f'"{domain}" "site:linkedin.com"', f'"{domain}" "about"']
     elif kind == "email":
         email = clean_email(q)
         local, domain_part = email.split("@", 1)
-        base_queries = [f'"{email}"', f"{email}", f'"{local}" "{domain_part}"', f'"{email}" "contact"', f'"{email}" "support"']
+        base_queries = [f'"{email}"', f"{email}", f'"{local}" "{domain_part}"', f'"{email}" "contact"', f'"{email}" "support"', f'"{local}" "company"']
     elif kind == "url":
         url = clean_url(q)
-        base_queries = [f'"{url}"', f"{url}", f'"{url}" "contact"', f'"{url}" "about"', f'"{url}" "company"']
+        base_queries = [f'"{url}"', f"{url}", f'"{url}" "contact"', f'"{url}" "about"', f'"{url}" "company"', f'"{url}" "team"']
     elif kind in ["person_or_company", "keyword"]:
-        base_queries = [f'"{cleaned}"', f"{cleaned}", f'"{cleaned}" "company"', f'"{cleaned}" "site:linkedin.com"', f'"{cleaned}" "contact"']
+        base_queries = [f'"{cleaned}"', f"{cleaned}", f'"{cleaned}" "company"', f'"{cleaned}" "site:linkedin.com"', f'"{cleaned}" "contact"', f'"{cleaned}" "team"']
     seen = set(); out: List[str] = []
     for item in base_queries:
         if item not in seen:
@@ -877,7 +884,38 @@ def run_search_with_fallback(query: str, kind: str, limit: int = 10, aggressive:
     return deduped[: max(limit * 3, 25)]
 
 
+def build_public_profile(query: str, kind: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    entity_candidates = []
+    for item in results:
+        entity_candidates.extend(item.get("entity_names", []))
+    deduped = list(dict.fromkeys([c for c in entity_candidates if c and len(c) > 2]))[:8]
+
+    source_counts: Dict[str, int] = {}
+    domains: Dict[str, int] = {}
+    for item in results:
+        source = item.get("source", "general")
+        source_counts[source] = source_counts.get(source, 0) + 1
+        domain = item.get("domain", "")
+        if domain:
+            domains[domain] = domains.get(domain, 0) + 1
+
+    top_domains = [name for name, _ in sorted(domains.items(), key=lambda x: x[1], reverse=True)[:5]]
+    dominant_source = max(source_counts.items(), key=lambda x: x[1], default=("general", 0))[0]
+    average_score = sum(item.get("score", 0) for item in results) / max(len(results), 1)
+    confidence = "high" if len(results) >= 4 and average_score >= 50 else "medium" if len(results) >= 2 and average_score >= 25 else "low"
+
+    return {
+        "entity_category": classify_query_label(query, kind),
+        "top_entities": deduped,
+        "top_domains": top_domains,
+        "dominant_source": dominant_source,
+        "average_score": round(average_score, 1),
+        "confidence": confidence,
+    }
+
+
 def build_intelligence_profile(query: str, kind: str, results: List[Dict[str, Any]], likely_owner: List[str], likely_usage: List[str]) -> Dict[str, Any]:
+    profile = build_public_profile(query, kind, results)
     entity_candidates = []
     for item in results:
         entity_candidates.extend(item.get("entity_names", []))
@@ -893,47 +931,39 @@ def build_intelligence_profile(query: str, kind: str, results: List[Dict[str, An
             domain_counts[domain] = domain_counts.get(domain, 0) + 1
     top_domains = sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)[:5]
 
-    source_counts: Dict[str, int] = {}
-    for item in results:
-        source = item.get("source", "general")
-        source_counts[source] = source_counts.get(source, 0) + 1
-
     score_value = max((item.get("score", 0) for item in results), default=0)
     average_score = sum(item.get("score", 0) for item in results) / max(len(results), 1)
     confidence_label = "high" if score_value >= 80 and len(results) >= 4 else "medium" if score_value >= 40 and len(results) >= 2 else "low"
 
-    entity_type = classify_query_label(query, kind)
     likely_name = deduped[0] if deduped else query
     likely_company = deduped[1] if len(deduped) > 1 else likely_name
 
     narrative = (
-        f"Public signals point most strongly to '{likely_name}' with '{likely_company}' as the likely brand or organizational anchor. "
-        f"The strongest matches are clustered around {', '.join([domain for domain, _ in top_domains][:3] or ['public web references'])}. "
-        f"The most likely use case appears to be {likely_usage[0] if likely_usage else 'Unknown'}, with a {confidence_label} confidence level based on source diversity and ranking strength."
+        f"Public-source evidence points most strongly to '{likely_name}' and suggests '{likely_company}' as the most likely public identity or brand anchor. "
+        f"The strongest references cluster around {', '.join([domain for domain, _ in top_domains][:3] or ['public web records'])}. "
+        f"The most likely use case appears to be {likely_usage[0] if likely_usage else 'Unknown'}, with a {confidence_label} confidence based on source diversity, match strength, and result ranking."
     )
 
-    profile = {
+    profile.update({
         "top_entities": deduped,
         "top_domains": [d for d, _ in top_domains],
-        "source_distribution": source_counts,
-        "query_type": kind,
-        "entity_category": entity_type,
         "likely_name": likely_name,
         "likely_company": likely_company,
         "likely_use_case": likely_usage[0] if likely_usage else "Unknown",
         "confidence": confidence_label,
         "average_score": round(average_score, 1),
-        "notes": [
-            "Public signals suggest the strongest matches are from trusted domains and relevant source types.",
-            "The model prioritizes domains with stronger credibility, title overlap, and content relevance.",
-        ],
         "narrative": narrative,
         "explanation": [
-            f"Strongest ranked result score: {score_value}",
+            f"Strongest ranked match score: {score_value}",
             f"Average result score: {round(average_score, 1)}",
+            f"Source profile: {profile.get('dominant_source', 'general')}",
             f"Top domains: {', '.join([d for d, _ in top_domains] or ['none detected'])}",
         ],
-    }
+        "notes": [
+            "This is public-source intelligence only and should not be treated as private identity verification.",
+            "The model rewards trusted domains, query overlap, and strong public references while down-weighting generic pages.",
+        ],
+    })
     return profile
 
 
@@ -1028,6 +1058,7 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
     ranked = prepare_ranked_results(result["search_results"], value)
     result["ranked_results"] = ranked
     result["summary"] = build_intelligence_profile(value, kind, ranked, result["likely_owner"], result["likely_usage"])
+    result["public_profile"] = build_public_profile(value, kind, ranked)
     confidence_value = max((item.get("score", 0) for item in ranked), default=0)
     if len(ranked) >= 5 and confidence_value >= 80:
         confidence = "high"
@@ -1036,6 +1067,7 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
     else:
         confidence = "low"
     result["summary"]["confidence"] = confidence
+    result["public_profile"]["confidence"] = confidence
     return result
 
 
@@ -1264,10 +1296,30 @@ def render_bulk_scan_ui() -> None:
         st.download_button("Download bulk JSON", data=json.dumps(results, indent=2, ensure_ascii=False).encode("utf-8"), file_name="bulk_results.json", mime="application/json")
 
 
+def render_deep_scan_mode() -> None:
+    st.subheader("Deep scan mode")
+    deep_query = st.text_input("Deep scan target", key="deep_scan_target", placeholder="company name, domain, or email")
+    deep_kind = st.selectbox("Deep scan type", ["all", "email", "domain", "phone", "person", "url"], index=0)
+    if st.button("Run deep scan"):
+        if not deep_query.strip():
+            st.warning("Please provide a target for deep scan.")
+            return
+        with st.spinner("Running deeper public-source investigation..."):
+            result = run_scan(deep_query, category=deep_kind, aggressive=True)
+        st.json({
+            "entity_type": result.get("type"),
+            "public_profile": result.get("public_profile"),
+            "summary": result.get("summary"),
+            "likely_owner": result.get("likely_owner"),
+            "likely_usage": result.get("likely_usage"),
+            "top_results": result.get("ranked_results", [])[:5],
+        })
+
+
 def main() -> None:
     render_mobile_css()
     st.title("Entity Intelligence")
-    st.caption("Search and analyze public data across people, companies, domains, phone numbers, emails, URLs, and numeric values.")
+    st.caption("Public-source intelligence for people, companies, domains, phone numbers, emails, URLs, and numeric values.")
     render_history_sidebar()
 
     with st.sidebar:
@@ -1276,7 +1328,7 @@ def main() -> None:
         aggressive = st.toggle("Aggressive search", value=False)
         min_score = st.slider("Minimum relevance score", 0, 80, 0)
         source_filter = st.selectbox("Source filter", ["all", "linkedin", "social", "search", "institution", "general"], index=0)
-        st.info("Use aggressive mode to search more deeply and rank more public results.")
+        st.info("Public-only intelligence: this system does not access private account data or protected personal records.")
 
         st.markdown("### Search provider status")
         provider_status = get_search_provider_status()
@@ -1338,6 +1390,7 @@ def main() -> None:
         st.markdown("---")
         render_downloads(result, search_input)
 
+    render_deep_scan_mode()
     render_bulk_scan_ui()
 
 
