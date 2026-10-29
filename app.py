@@ -27,11 +27,14 @@ def get_secret(name: str, default: str = "") -> str:
             secrets = st.secrets
             if isinstance(secrets, dict) and name in secrets:
                 value = secrets.get(name)
-                return str(value).strip() if value not in (None, "") else default
+                if value not in (None, ""):
+                    return str(value).strip()
     except Exception:
         pass
     value = os.getenv(name)
-    return str(value).strip() if value not in (None, "") else default
+    if value not in (None, ""):
+        return str(value).strip()
+    return default
 
 
 SERPAPI_KEY = get_secret("SERPAPI_API_KEY")
@@ -53,11 +56,34 @@ STOP_WORDS = {
     "the", "this", "that", "search", "results", "page", "website", "about",
     "contact", "support", "home", "login", "sign", "up", "news", "business",
     "company", "site", "official", "welcome", "help", "services", "products",
+    "pricing", "profile", "company", "directory", "find", "people", "team" 
+}
+
+GENERIC_TITLE_TOKENS = {
+    "home", "homepage", "index", "login", "sign in", "contact us", "contact",
+    "support", "help", "faq", "about us", "about", "services", "products",
+    "pricing", "news", "blog", "search", "results"
 }
 
 
 def normalize_whitespace(value: str) -> str:
     return (value or "").strip()
+
+
+def is_person_like_name(value: str) -> bool:
+    cleaned = normalize_whitespace(value)
+    if not cleaned or cleaned.isdigit():
+        return False
+    if re.fullmatch(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", cleaned):
+        return False
+    if "http" in cleaned.lower() or "." in cleaned:
+        return False
+    words = cleaned.split()
+    if len(words) == 1 and len(words[0]) <= 2:
+        return False
+    if len(words) <= 4 and any(ch.isalpha() for ch in cleaned):
+        return True
+    return False
 
 
 def detect_type(raw: str) -> str:
@@ -76,7 +102,7 @@ def detect_type(raw: str) -> str:
         return "username"
     if value.isdigit() and len(value) >= 4:
         return "number"
-    if value.count(" ") >= 1:
+    if is_person_like_name(value) or value.count(" ") >= 1:
         return "person_or_company"
     return "keyword"
 
@@ -103,6 +129,8 @@ def clean_domain(raw: str) -> str:
 
 def clean_url(raw: str) -> str:
     value = normalize_whitespace(raw)
+    if not value:
+        return ""
     if not value.startswith(("http://", "https://")):
         value = "https://" + value
     return value
@@ -134,22 +162,9 @@ def load_history() -> List[Dict[str, Any]]:
         pass
 
     try:
-        component_value = st.components.v1.html(
-            f"""
-            <script>
-            try {{
-                const key = '{APP_STORAGE_KEY}';
-                const value = JSON.parse(localStorage.getItem(key) || '[]');
-                window.parent.postMessage({{type: 'streamlit:setComponentValue', value: value}}, '*');
-            }} catch (error) {{
-                window.parent.postMessage({{type: 'streamlit:setComponentValue', value: []}}, '*');
-            }}
-            </script>
-            """,
-            height=0,
-        )
-        if isinstance(component_value, list):
-            history = component_value
+        stored = st.session_state.get("browser_history")
+        if isinstance(stored, list):
+            history = stored
             st.session_state["history_cache"] = history
             return history
     except Exception:
@@ -168,17 +183,7 @@ def save_history(history: List[Dict[str, Any]]) -> None:
         pass
 
     try:
-        script = f"""
-        <script>
-        try {{
-            const key = '{APP_STORAGE_KEY}';
-            const value = {json.dumps(normalized)};
-            localStorage.setItem(key, JSON.stringify(value));
-            window.parent.postMessage({{type: 'streamlit:setComponentValue', value: value}}, '*');
-        }} catch (error) {{}}
-        </script>
-        """
-        st.components.v1.html(script, height=0)
+        st.session_state["browser_history"] = normalized
     except Exception:
         pass
 
@@ -218,6 +223,15 @@ def get_source_weight(domain: str) -> float:
     return SOURCE_WEIGHTS.get(get_source_label(domain), 0.9)
 
 
+def strip_generic_title(title: str) -> str:
+    value = normalize_whitespace(title)
+    lowered = value.lower()
+    for token in GENERIC_TITLE_TOKENS:
+        if lowered == token or lowered.endswith(token):
+            return ""
+    return value
+
+
 def extract_entity_names(text: str) -> List[str]:
     cleaned = re.sub(r"https?://\S+", " ", text)
     cleaned = re.sub(r"\b(?:www\.|com|net|org|io|co|gov|edu)\b", " ", cleaned, flags=re.I)
@@ -238,6 +252,34 @@ def extract_entity_names(text: str) -> List[str]:
     return names[:8]
 
 
+def query_tokens(query: str) -> List[str]:
+    value = normalize_whitespace(query).lower()
+    value = re.sub(r"[^a-z0-9\s]", " ", value)
+    return [token for token in value.split() if len(token) > 1]
+
+
+def safe_domain_root(domain: str) -> str:
+    clean = clean_domain(domain)
+    if not clean:
+        return ""
+    root = clean.split(".")[0]
+    return root.strip("-")
+
+
+def score_title_match(title: str, query: str) -> int:
+    text = normalize_whitespace(title).lower()
+    q = normalize_whitespace(query).lower()
+    if not text or not q:
+        return 0
+    score = 0
+    if q in text:
+        score += 30
+    tokens = query_tokens(q)
+    matched = sum(1 for token in tokens if token in text)
+    score += matched * 10
+    return score
+
+
 def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
     title = (item.get("title") or "").strip()
     snippet = (item.get("snippet") or "").strip()
@@ -245,41 +287,66 @@ def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
     domain = extract_domain_from_link(link)
     text = f"{title} {snippet}".lower()
     q = normalize_whitespace(query).lower()
-
-    score = 0
+    base_score = 0
     source_weight = get_source_weight(domain)
 
+    # Query-related evidence
     if q and q in text:
-        score += 30
+        base_score += 30
     if q and q in title.lower():
-        score += 22
+        base_score += 22
     if q and q in domain.lower():
-        score += 18
+        base_score += 18
+
+    # Token overlap
+    tokens = query_tokens(q)
+    if tokens:
+        title_hits = sum(1 for token in tokens if token in title.lower())
+        snippet_hits = sum(1 for token in tokens if token in snippet.lower())
+        domain_hits = sum(1 for token in tokens if token in domain.lower())
+        base_score += title_hits * 10 + snippet_hits * 7 + domain_hits * 5
+
+    # Domain and source confidence
     if domain:
-        score += 10
+        base_score += 10
     if "linkedin.com" in domain:
-        score += 18
+        base_score += 18
     if "facebook.com" in domain:
-        score += 12
+        base_score += 12
+    if "google" in domain:
+        base_score += 4
+    if any(token in d for d in [domain.lower()] for token in ["gov", "edu", "org"]):
+        base_score += 8
+
+    # Content quality
     if any(k in text for k in ["support", "contact", "customer", "sales", "pricing", "business", "company", "account", "invoice"]):
-        score += 8
-    if any(k in title.lower() for k in ["contact", "support", "sales", "help", "customer", "pricing"]):
-        score += 12
+        base_score += 8
+    if any(k in title.lower() for k in ["contact", "support", "sales", "help", "customer", "pricing", "official"]):
+        base_score += 10
     if title:
-        score += 6
+        base_score += 6
     if snippet:
-        score += 4
+        base_score += 4
 
-    score = int(score * source_weight)
+    # Reduce generic home/login pages unless query is explicitly a page or site
+    clean_title = strip_generic_title(title)
+    if not clean_title and ("home" in title.lower() or "login" in title.lower() or "support" in title.lower()):
+        base_score -= 12
 
+    # Query-specific penalties
+    if q and any(phrase in text for phrase in ["login", "sign in", "register", "download pdf"]):
+        base_score -= 10
+
+    score = int(base_score * source_weight)
     return {
         "title": title,
         "link": link,
         "snippet": snippet,
         "domain": domain,
-        "score": score,
+        "score": max(0, score),
         "source": get_source_label(domain),
         "entity_names": extract_entity_names(f"{title} {snippet}"),
+        "owner_hint": safe_domain_root(domain),
     }
 
 
@@ -374,25 +441,32 @@ def duckduckgo_search(query: str, limit: int = 8) -> List[Dict[str, str]]:
 def build_search_queries(query: str, kind: str) -> List[str]:
     q = normalize_whitespace(query)
     cleaned = re.sub(r"\s+", " ", q)
-    queries = [f'"{cleaned}"', f'"{cleaned}" "contact"', f'"{cleaned}" "support"', f'"{cleaned}" "company"']
+    base_queries = [f'"{cleaned}"', f"{cleaned}", f'"{cleaned}" "contact"', f'"{cleaned}" "support"', f'"{cleaned}" "company"']
     if kind == "phone":
         digits = re.sub(r"\D", "", q)
-        queries = [f'"{digits}"', f'"{digits}" "phone"', f'"{digits}" "business"', f'"{digits}" "support"']
+        base_queries = [f'"{digits}"', f"{digits}", f'"{digits}" "phone"', f'"{digits}" "business"', f'"{digits}" "support"']
     elif kind == "number":
         digits = re.sub(r"\D", "", q)
-        queries = [f'"{digits}"', f'"{digits}" "reference"', f'"{digits}" "invoice"', f'"{digits}" "account"']
+        base_queries = [f'"{digits}"', f"{digits}", f'"{digits}" "reference"', f'"{digits}" "invoice"', f'"{digits}" "account"']
     elif kind == "domain":
         domain = clean_domain(q)
-        queries = [f'"{domain}"', f'"{domain}" "company"', f'"{domain}" "contact"', f'"{domain}" "site:linkedin.com"']
+        base_queries = [f'"{domain}"', f"{domain}", f'"{domain}" "company"', f'"{domain}" "contact"', f'"{domain}" "site:linkedin.com"']
     elif kind == "email":
         email = clean_email(q)
-        queries = [f'"{email}"', f'"{email}" "contact"', f'"{email}" "support"', f'"{email}" "domain"']
+        local = email.split("@")[0]
+        domain_part = email.split("@")[-1]
+        base_queries = [f'"{email}"', f"{email}", f'"{local}" "{domain_part}"', f'"{email}" "contact"', f'"{email}" "support"']
     elif kind == "url":
         url = clean_url(q)
-        queries = [f'"{url}"', f'"{url}" "contact"', f'"{url}" "about"', f'"{url}" "company"']
+        base_queries = [f'"{url}"', f"{url}", f'"{url}" "contact"', f'"{url}" "about"', f'"{url}" "company"']
     elif kind in ["person_or_company", "keyword"]:
-        queries = [f'"{cleaned}"', f'"{cleaned}" "company"', f'"{cleaned}" "site:linkedin.com"', f'"{cleaned}" "contact"']
-    return queries[:6]
+        base_queries = [f'"{cleaned}"', f"{cleaned}", f'"{cleaned}" "company"', f'"{cleaned}" "site:linkedin.com"', f'"{cleaned}" "contact"']
+    seen = set(); out: List[str] = []
+    for item in base_queries:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out[:8]
 
 
 def search_all(query: str, kind: str = "all", limit: int = 10, aggressive: bool = False) -> List[Dict[str, str]]:
@@ -416,10 +490,21 @@ def guess_owner(results: List[Dict[str, str]]) -> List[str]:
     seen = set()
     for item in results:
         title = (item.get("title") or "").strip()
-        cleaned = re.sub(r"[-–|:—].*$", "", title).strip()
+        cleaned = strip_generic_title(title)
+        if not cleaned:
+            continue
+        cleaned = re.sub(r"[-–|:—].*$", "", cleaned).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
         if cleaned and len(cleaned) > 2 and cleaned not in seen:
             owners.append(cleaned)
             seen.add(cleaned)
+    if not owners:
+        for item in results:
+            domain = extract_domain_from_link(item.get("link", ""))
+            root = safe_domain_root(domain)
+            if root and root not in seen:
+                owners.append(root)
+                seen.add(root)
     return owners[:8]
 
 
@@ -633,6 +718,84 @@ def build_risk_brief(raw: str, kind: str) -> Dict[str, Any]:
     return {"risk_level": level, "score": score, "signals": signals[:10]}
 
 
+def get_search_provider_status() -> Dict[str, Any]:
+    return {
+        "serpapi": bool(SERPAPI_KEY),
+        "google_cse": bool(GOOGLE_CSE_KEY and GOOGLE_CSE_CX),
+        "duckduckgo": True,
+        "numverify": bool(NUMVERIFY_KEY),
+    }
+
+
+def normalize_kind(category: str, raw_value: str) -> str:
+    mapping = {"person": "person_or_company", "company": "person_or_company"}
+    if category == "all":
+        return detect_type(raw_value)
+    return mapping.get(category, category)
+
+
+def search_quality_score(results: List[Dict[str, Any]], query: str) -> int:
+    if not results:
+        return 0
+    average_score = sum(item.get("score", 0) for item in results) / max(len(results), 1)
+    return int(average_score)
+
+
+def fallback_search_variants(query: str, kind: str) -> List[str]:
+    value = normalize_whitespace(query)
+    variants = [value]
+    if kind == "email":
+        if "@" in value:
+            local, domain = value.split("@", 1)
+            variants.extend([local, domain, f'"{local}" "{domain}"', f'{domain} "{local}"'])
+    elif kind == "phone":
+        digits = re.sub(r"\D", "", value)
+        variants.extend([digits, f'"{digits}" phone', f'"{digits}" customer support'])
+    elif kind == "domain":
+        domain = clean_domain(value)
+        variants.extend([domain, f'"{domain}" official', f'"{domain}" contact'])
+    elif kind == "url":
+        url = clean_url(value)
+        variants.extend([url, f'"{url}" company', f'"{url}" contact'])
+    elif kind in ["person_or_company", "keyword"]:
+        tokens = [part for part in re.split(r"\s+", value) if part]
+        if len(tokens) > 1:
+            variants.append(" ".join(tokens[:2]))
+        variants.extend([f'"{value}" official', f'"{value}" company', f'"{value}" linkedin'])
+    deduped = []
+    seen = set()
+    for item in variants:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped[:10]
+
+
+def run_search_with_fallback(query: str, kind: str, limit: int = 10, aggressive: bool = False) -> List[Dict[str, str]]:
+    primary = search_all(query, kind=kind, limit=limit, aggressive=aggressive)
+    quality = search_quality_score(primary, query)
+    if len(primary) >= 3 and quality >= 30:
+        return primary
+
+    for variant in fallback_search_variants(query, kind):
+        if variant == query:
+            continue
+        extra = search_all(variant, kind=kind, limit=max(6, limit), aggressive=aggressive)
+        if extra:
+            primary.extend(extra)
+        if len(primary) >= 8 and search_quality_score(primary, query) >= 30:
+            break
+
+    deduped: List[Dict[str, str]] = []
+    seen = set()
+    for item in primary:
+        key = (item.get("title"), item.get("link"))
+        if key not in seen and item.get("link"):
+            seen.add(key)
+            deduped.append(item)
+    return deduped[: max(limit * 3, 25)]
+
+
 def build_intelligence_profile(query: str, kind: str, results: List[Dict[str, Any]], likely_owner: List[str], likely_usage: List[str]) -> Dict[str, Any]:
     entity_candidates = []
     for item in results:
@@ -654,36 +817,41 @@ def build_intelligence_profile(query: str, kind: str, results: List[Dict[str, An
         source = item.get("source", "general")
         source_counts[source] = source_counts.get(source, 0) + 1
 
+    score_value = max((item.get("score", 0) for item in results), default=0)
+    average_score = sum(item.get("score", 0) for item in results) / max(len(results), 1)
+    confidence_label = "high" if score_value >= 80 and len(results) >= 4 else "medium" if score_value >= 40 and len(results) >= 2 else "low"
+
+    likely_name = deduped[0] if deduped else query
+    likely_company = deduped[1] if len(deduped) > 1 else likely_name
+
+    narrative = (
+        f"Public signals point most strongly to '{likely_name}' with '{likely_company}' as the likely brand or organizational anchor. "
+        f"The strongest matches are clustered around {', '.join([domain for domain, _ in top_domains][:3] or ['public web references'])}. "
+        f"The most likely use case appears to be {likely_usage[0] if likely_usage else 'Unknown'}, with a {confidence_label} confidence level based on source diversity and ranking strength."
+    )
+
     profile = {
         "top_entities": deduped,
         "top_domains": [d for d, _ in top_domains],
         "source_distribution": source_counts,
         "query_type": kind,
-        "likely_name": deduped[0] if deduped else query,
-        "likely_company": deduped[1] if len(deduped) > 1 else deduped[0] if deduped else query,
+        "likely_name": likely_name,
+        "likely_company": likely_company,
         "likely_use_case": likely_usage[0] if likely_usage else "Unknown",
+        "confidence": confidence_label,
+        "average_score": round(average_score, 1),
         "notes": [
             "Public search signals suggest the strongest matches are from trusted domains and relevant source types.",
-            "The model prioritizes domains with stronger credibility and attaches relevance scores based on title/snippet overlap.",
+            "The model prioritizes domains with stronger credibility, title overlap, and content relevance.",
+        ],
+        "narrative": narrative,
+        "explanation": [
+            f"Strongest ranked result score: {score_value}",
+            f"Average result score: {round(average_score, 1)}",
+            f"Top domains: {', '.join([d for d, _ in top_domains] or ['none detected'])}",
         ],
     }
     return profile
-
-
-def get_search_provider_status() -> Dict[str, Any]:
-    return {
-        "serpapi": bool(SERPAPI_KEY),
-        "google_cse": bool(GOOGLE_CSE_KEY and GOOGLE_CSE_CX),
-        "duckduckgo": True,
-        "numverify": bool(NUMVERIFY_KEY),
-    }
-
-
-def normalize_kind(category: str, raw_value: str) -> str:
-    mapping = {"person": "person_or_company", "company": "person_or_company"}
-    if category == "all":
-        return detect_type(raw_value)
-    return mapping.get(category, category)
 
 
 def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[str, Any]:
@@ -694,7 +862,7 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
     if kind == "email":
         email = clean_email(value)
         result["email"] = email
-        raw_results = search_all(f'"{email}"', kind="email", limit=10, aggressive=aggressive)
+        raw_results = run_search_with_fallback(f'"{email}"', kind="email", limit=10, aggressive=aggressive)
         result["search_results"] = raw_results
         result["likely_owner"] = guess_owner(raw_results)
         result["likely_usage"] = guess_usage(raw_results)
@@ -705,7 +873,7 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
         parsed = parse_phone_details(phone)
         result["parsed"] = parsed
         result["numverify"] = numverify_lookup(parsed["international"])
-        raw_results = search_all(f'"{phone}"', kind="phone", limit=12, aggressive=aggressive)
+        raw_results = run_search_with_fallback(f'"{phone}"', kind="phone", limit=12, aggressive=aggressive)
         result["search_results"] = raw_results
         result["likely_owner"] = guess_owner(raw_results)
         result["likely_usage"] = guess_usage(raw_results)
@@ -717,7 +885,7 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
         result["domain"] = domain
         result["domain_info"] = get_domain_info(domain)
         result["related_domains"] = get_related_domains(domain)
-        raw_results = search_all(f'"{domain}"', kind="domain", limit=12, aggressive=aggressive)
+        raw_results = run_search_with_fallback(f'"{domain}"', kind="domain", limit=12, aggressive=aggressive)
         result["search_results"] = raw_results
         result["likely_owner"] = guess_owner(raw_results)
         result["likely_usage"] = guess_usage(raw_results)
@@ -727,7 +895,7 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
         result["url"] = url
         result["url_details"] = {"host": urlparse(url).netloc.lower(), "path": urlparse(url).path, "query": urlparse(url).query}
         result["website_fingerprint"] = website_fingerprint(url)
-        raw_results = search_all(f'"{url}"', kind="url", limit=12, aggressive=aggressive)
+        raw_results = run_search_with_fallback(f'"{url}"', kind="url", limit=12, aggressive=aggressive)
         result["search_results"] = raw_results
         result["likely_owner"] = guess_owner(raw_results)
         result["likely_usage"] = guess_usage(raw_results)
@@ -735,7 +903,7 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
     elif kind == "username":
         username = value.lstrip("@")
         result["username"] = username
-        raw_results = search_all(f'"{username}"', kind="username", limit=12, aggressive=aggressive)
+        raw_results = run_search_with_fallback(f'"{username}"', kind="username", limit=12, aggressive=aggressive)
         result["search_results"] = raw_results
         result["likely_owner"] = guess_owner(raw_results)
         result["likely_usage"] = guess_usage(raw_results)
@@ -756,13 +924,13 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
             result["region"] = parsed.get("region")
         all_results = []
         for q in build_number_queries(digits):
-            all_results.extend(search_all(q, kind="number", limit=5, aggressive=aggressive))
+            all_results.extend(run_search_with_fallback(q, kind="number", limit=5, aggressive=aggressive))
         result["search_results"] = all_results[:60]
         result["likely_owner"] = guess_owner(result["search_results"])
         result["likely_usage"] = guess_usage(result["search_results"])
 
     elif kind in ["person_or_company", "keyword"]:
-        raw_results = search_all(f'"{value}"', kind="person_or_company", limit=12, aggressive=aggressive)
+        raw_results = run_search_with_fallback(f'"{value}"', kind="person_or_company", limit=12, aggressive=aggressive)
         result["search_results"] = raw_results
         result["likely_owner"] = guess_owner(raw_results)
         result["likely_usage"] = guess_usage(raw_results)
@@ -785,6 +953,7 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
     else:
         confidence = "low"
     result["summary"]["confidence"] = confidence
+    result["summary"]["narrative"] = result["summary"].get("narrative", "")
     return result
 
 
@@ -863,6 +1032,8 @@ def render_intelligence_profile(data: Dict[str, Any]) -> None:
         st.info("Not enough data to generate an intelligence profile.")
         return
 
+    st.info(profile.get("narrative", "No summary available."))
+
     col1, col2 = st.columns(2)
     with col1:
         st.markdown("**Likely identity**")
@@ -890,6 +1061,9 @@ def render_intelligence_profile(data: Dict[str, Any]) -> None:
 
 def render_who_what_panel(data: Dict[str, Any]) -> None:
     st.subheader("Who / what is this?")
+    summary = data.get("summary", {})
+    if summary.get("narrative"):
+        st.markdown(summary["narrative"])
     if data.get("likely_owner"):
         st.markdown("Likely owner or brand clues:")
         st.code(", ".join(data["likely_owner"]))
