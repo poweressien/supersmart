@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from io import BytesIO
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -20,6 +21,7 @@ SERPAPI_KEY = os.getenv("SERPAPI_API_KEY")
 GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY")
 GOOGLE_CSE_CX = os.getenv("GOOGLE_CSE_CX")
 NUMVERIFY_KEY = os.getenv("NUMVERIFY_API_KEY")
+APP_HISTORY_PATH = os.path.join(os.path.dirname(__file__), "history.json")
 
 st.set_page_config(page_title="Entity Intelligence", page_icon="🔎", layout="wide")
 
@@ -86,6 +88,125 @@ def clean_url(raw: str) -> str:
 
 def slugify(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")[:60] or "result"
+
+
+def load_history() -> List[Dict[str, Any]]:
+    try:
+        if os.path.exists(APP_HISTORY_PATH):
+            with open(APP_HISTORY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+    except Exception:
+        pass
+    return []
+
+
+def save_history(history: List[Dict[str, Any]]) -> None:
+    try:
+        with open(APP_HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(history[:20], f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def add_history_item(value: str, category: str) -> None:
+    history = load_history()
+    item = {"value": value, "category": category}
+    history = [x for x in history if x.get("value", "").lower() != value.lower()]
+    history.insert(0, item)
+    save_history(history)
+
+
+def extract_domain_from_link(link: str) -> str:
+    try:
+        host = urlparse(link).netloc.lower()
+        host = host.replace("www.", "")
+        return host
+    except Exception:
+        return ""
+
+
+def extract_entity_candidates(text: str) -> List[str]:
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"\b(?:www\.|com|net|org|io|co|gov|edu)\b", " ", text, flags=re.I)
+    matches = re.findall(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}|[A-Z]{2,})\b", text)
+    cleaned = []
+    stop = {"The", "This", "That", "Search", "Results", "Page", "Website", "Contact", "Support", "Home", "About", "News"}
+    for m in matches:
+        if m not in stop and len(m) > 2:
+            cleaned.append(m.strip())
+    deduped = []
+    seen = set()
+    for item in cleaned:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped[:6]
+
+
+def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
+    title = item.get("title", "")
+    snippet = item.get("snippet", "")
+    link = item.get("link", "")
+    domain = extract_domain_from_link(link)
+    text = f"{title} {snippet}".lower()
+    q = query.lower().strip()
+
+    score = 0
+    if q and q in text:
+        score += 35
+    if q and q in title.lower():
+        score += 15
+    if q and q in domain.lower():
+        score += 20
+    if domain:
+        score += 5
+    if "linkedin.com" in domain:
+        score += 12
+    if "facebook.com" in domain:
+        score += 8
+    if "google" in domain:
+        score += 4
+    if any(k in text for k in ["support", "contact", "customer", "sales", "pricing", "business", "company", "account", "invoice"]):
+        score += 6
+    if any(k in title.lower() for k in ["contact", "support", "sales", "help", "customer"]):
+        score += 8
+    if title:
+        score += 4
+    if snippet:
+        score += 3
+
+    return {
+        "title": title,
+        "link": link,
+        "snippet": snippet,
+        "domain": domain,
+        "score": score,
+        "entity_names": extract_entity_candidates(f"{title} {snippet}"),
+    }
+
+
+def prepare_results(results: List[Dict[str, str]], query: str) -> List[Dict[str, Any]]:
+    ranked = [rank_result(item, query) for item in results]
+    ranked = [item for item in ranked if item.get("title") or item.get("link") or item.get("snippet")]
+    ranked.sort(key=lambda x: x.get("score", 0), reverse=True)
+    return ranked
+
+
+def get_source_filter_label(domain: str) -> str:
+    d = domain.lower()
+    if "linkedin" in d:
+        return "linkedin"
+    if "facebook" in d:
+        return "facebook"
+    if "twitter" in d or "x.com" in d:
+        return "social"
+    if "google" in d:
+        return "search"
+    if any(x in d for x in ["gov", "edu", "org"]):
+        return "institution"
+    return "general"
 
 
 def http_get_json(url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
@@ -168,15 +289,6 @@ def search_all(query: str, limit: int = 10, aggressive: bool = False) -> List[Di
                 seen.add(key)
                 results.append(item)
     return results[: max(limit * 3, 25) if aggressive else limit * 3]
-
-
-def extract_domain_from_link(link: str) -> str:
-    try:
-        host = urlparse(link).netloc.lower()
-        host = host.replace("www.", "")
-        return host
-    except Exception:
-        return ""
 
 
 def guess_owner(results: List[Dict[str, str]]) -> List[str]:
@@ -535,19 +647,40 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
     return result
 
 
-def render_result_card(item: Dict[str, str]) -> None:
+def filter_ranked_results(ranked_results: List[Dict[str, Any]], min_score: int = 0, domain_filter: str = "all", source_filter: str = "all") -> List[Dict[str, Any]]:
+    filtered = []
+    for item in ranked_results:
+        if item.get("score", 0) < min_score:
+            continue
+        if domain_filter and domain_filter != "all":
+            if item.get("domain", "").lower() != domain_filter.lower():
+                continue
+        if source_filter and source_filter != "all":
+            if get_source_filter_label(item.get("domain", "")) != source_filter.lower():
+                continue
+        filtered.append(item)
+    return filtered
+
+
+def render_result_card(item: Dict[str, Any]) -> None:
     title = item.get("title", "Untitled")
     link = item.get("link", "")
     snippet = item.get("snippet", "")
-    domain = extract_domain_from_link(link)
+    domain = item.get("domain", "")
+    score = item.get("score", 0)
+    entity_names = item.get("entity_names", [])
 
     with st.container():
         st.markdown(
             f"""
-            <div style="border:1px solid #2d3b53; border-radius:12px; padding:12px 14px; margin-bottom:12px; background:#0f172a;">
-                <div style="font-size:13px; color:#93c5fd; margin-bottom:6px;">{domain}</div>
-                <div style="font-size:20px; font-weight:600; margin-bottom:6px;"><a href="{link}" target="_blank" style="color:#e2e8f0; text-decoration:none;">{title}</a></div>
-                <div style="font-size:14px; color:#cbd5e1; line-height:1.5;">{snippet}</div>
+            <div style="border:1px solid #2d3b53; border-radius:14px; padding:14px 16px; margin-bottom:12px; background:linear-gradient(180deg,#111827,#0f172a); box-shadow:0 2px 10px rgba(15,23,42,0.35);">
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:8px; flex-wrap:wrap;">
+                    <div style="font-size:12px; color:#93c5fd;">{domain}</div>
+                    <div style="font-size:12px; color:#cbd5e1; background:#1e293b; padding:4px 8px; border-radius:999px;">score {score}</div>
+                </div>
+                <div style="font-size:20px; font-weight:600; margin-bottom:8px;"><a href="{link}" target="_blank" style="color:#f8fafc; text-decoration:none;">{title}</a></div>
+                <div style="font-size:13px; color:#cbd5e1; margin-bottom:8px;">entity hints: {', '.join(entity_names) if entity_names else 'n/a'}</div>
+                <div style="font-size:14px; color:#dbeafe; line-height:1.6;">{snippet}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -583,19 +716,6 @@ def render_who_what_panel(data: Dict[str, Any]) -> None:
         st.write(data["wikipedia"].get("title"))
         st.write(data["wikipedia"].get("summary", "")[:1000])
         st.caption(data["wikipedia"].get("url", ""))
-
-
-def render_where_appears_panel(data: Dict[str, Any], filter_by_domain: Optional[str] = None) -> None:
-    st.subheader("Where does it appear?")
-    results = data.get("search_results", [])
-    if filter_by_domain:
-        results = [item for item in results if filter_by_domain.lower() in extract_domain_from_link(item.get("link", "")).lower()]
-
-    if results:
-        for item in results[:12]:
-            render_result_card(item)
-    else:
-        st.info("No public matches were found for the selected filter.")
 
 
 def render_usage_panel(data: Dict[str, Any]) -> None:
@@ -643,6 +763,11 @@ def render_downloads(data: Dict[str, Any], input_value: str) -> None:
     df = pd.DataFrame(csv_lines)
     csv_bytes = df.to_csv(index=False).encode("utf-8")
 
+    excel_buffer = BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="results")
+    excel_bytes = excel_buffer.getvalue()
+
     st.markdown("### Download results")
     st.download_button(
         label="Download JSON",
@@ -656,6 +781,26 @@ def render_downloads(data: Dict[str, Any], input_value: str) -> None:
         file_name=f"{slugify(input_value)}.csv",
         mime="text/csv",
     )
+    st.download_button(
+        label="Download Excel",
+        data=excel_bytes,
+        file_name=f"{slugify(input_value)}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+def render_history_sidebar() -> None:
+    history = load_history()
+    if not history:
+        return
+
+    st.sidebar.subheader("Recent scans")
+    for idx, item in enumerate(history[:8]):
+        label = f"{item.get('value', 'unknown')}"
+        if st.sidebar.button(label, key=f"history_{idx}_{item.get('value', '')}"):
+            st.session_state.search_input = item.get("value", "")
+            st.session_state.category = item.get("category", "all")
+            st.rerun()
 
 
 def render_bulk_scan_ui() -> None:
@@ -673,14 +818,21 @@ def render_bulk_scan_ui() -> None:
         for entry in entries:
             try:
                 item = run_scan(entry, category=bulk_category, aggressive=aggressive)
-                results.append({"input": entry, "type": item.get("type"), "risk": item.get("risk"), "likely_owner": item.get("likely_owner", []), "likely_usage": item.get("likely_usage", []), "public_results": item.get("search_results", [])[:5]})
+                results.append({
+                    "input": entry,
+                    "type": item.get("type"),
+                    "risk": item.get("risk"),
+                    "likely_owner": item.get("likely_owner", []),
+                    "likely_usage": item.get("likely_usage", []),
+                    "public_results": item.get("search_results", [])[:5],
+                })
             except Exception as exc:  # pragma: no cover
                 results.append({"input": entry, "error": str(exc)})
 
         st.success(f"Finished bulk scan for {len(results)} record(s).")
         st.json(results)
 
-        df = pd.DataFrame(results)
+        bulk_df = pd.DataFrame(results)
         st.download_button(
             label="Download bulk results as JSON",
             data=json.dumps(results, indent=2, ensure_ascii=False).encode("utf-8"),
@@ -693,6 +845,8 @@ def main() -> None:
     st.title("Entity Intelligence")
     st.caption("Search and analyze public data across people, companies, domains, phone numbers, emails, URLs, and numeric values.")
 
+    render_history_sidebar()
+
     with st.sidebar:
         st.header("Search settings")
         category = st.selectbox(
@@ -701,11 +855,11 @@ def main() -> None:
             index=0,
         )
         aggressive = st.toggle("Aggressive search", value=False)
+        min_score = st.slider("Minimum relevance score", 0, 80, 0)
+        source_filter = st.selectbox("Source filter", ["all", "linkedin", "facebook", "social", "search", "institution", "general"], index=0)
         st.info("Use aggressive mode to search more deeply and pull more results from public sources.")
 
-        all_domains = st.checkbox("Filter visible results by domain", value=False)
-
-    search_input = st.text_input("Enter a value to scan", placeholder="e.g. 1234567890, +1 555 123 4567, example.com, user@example.com, @username, Apple Inc.")
+    search_input = st.text_input("Enter a value to scan", value=st.session_state.get("search_input", ""), key="search_input", placeholder="e.g. 1234567890, +1 555 123 4567, example.com, user@example.com, @username, Apple Inc.")
 
     if st.button("Search"):
         if not search_input.strip():
@@ -715,22 +869,27 @@ def main() -> None:
         with st.spinner("Scanning public results..."):
             result = run_scan(search_input, category=category, aggressive=aggressive)
 
+        add_history_item(search_input, category)
+
+        ranked = prepare_results(result.get("search_results", []), search_input)
+        filtered = filter_ranked_results(ranked, min_score=min_score, domain_filter="all", source_filter=source_filter)
+        result["search_results_ranked"] = filtered
+
         render_summary_cards(result)
         st.markdown("---")
-
-        filter_domain = None
-        if all_domains and result.get("search_results"):
-            domains = sorted({extract_domain_from_link(item.get("link", "")) for item in result["search_results"] if extract_domain_from_link(item.get("link", ""))})
-            filter_domain = st.selectbox("Filter by domain", ["all"] + domains, index=0)
-            if filter_domain != "all":
-                filter_domain = filter_domain
-            else:
-                filter_domain = None
 
         render_who_what_panel(result)
         st.markdown("---")
 
-        render_where_appears_panel(result, filter_by_domain=filter_domain)
+        st.subheader("Where does it appear?")
+        domain_options = ["all"] + sorted({item.get("domain", "") for item in filtered if item.get("domain")})
+        domain_filter = st.selectbox("Filter by domain", domain_options, index=0)
+        domain_filtered = filter_ranked_results(filtered, min_score=min_score, domain_filter=domain_filter if domain_filter != "all" else "all", source_filter=source_filter)
+        if domain_filtered:
+            for item in domain_filtered[:12]:
+                render_result_card(item)
+        else:
+            st.info("No results matched the selected filters.")
         st.markdown("---")
 
         render_usage_panel(result)

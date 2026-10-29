@@ -7,11 +7,13 @@ A polished local browser app for scanning people, companies, domains, phone numb
 - Bulk scan mode for many numbers or values
 - Category-aware detection
 - Aggressive search toggle
-- Risk score and owner/use-case hints
-- Result cards + domain filters
-- JSON/CSV export
+- Smarter result filtering
+- Stronger source ranking
+- Person/company extraction hints
+- Recent scan history
+- JSON / CSV / Excel export
 - Works without API keys using public search fallback
-- Desktop app launcher script for local use
+- Desktop app launcher + packaging script
 
 ## Run the web app
 ```bash
@@ -30,6 +32,13 @@ python desktop_app.py
 ```bash
 python bulk_scan.py --input values.txt --output results.json
 ```
+
+## Package the desktop app
+```bash
+python build_app.py
+```
+
+This creates a packaged binary in the `dist/` folder for the current operating system.
 
 ## Input file format for bulk scan
 Each line can be one value:
