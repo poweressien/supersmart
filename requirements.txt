@@ -1,11 +1,40 @@
-streamlit>=1.33.0
-requests>=2.31.0
-python-dotenv>=1.0.1
-phonenumbers>=8.13.0
-python-whois>=0.8.0
-wikipedia-api>=0.6.0
-duckduckgo-search>=6.1.0
-beautifulsoup4>=4.12.0
-pandas>=2.0.0
-openpyxl>=3.1.0
-pyinstaller>=6.0.0
+# Entity Intelligence
+
+A polished local browser app for public entity investigation.
+
+## What this app does
+- Detects and analyzes phone numbers, domains, emails, URLs, usernames, and person/company-like names
+- Runs public search queries and ranks sources by relevance
+- Identifies likely owner clues and likely use-case patterns
+- Surfaces country/region, public references, and risk metadata
+- Exports results to JSON, CSV, and Excel
+- Supports bulk scanning from a text file
+- Includes a desktop app wrapper and package script
+
+## Run the web app
+```bash
+python -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Run the desktop app
+```bash
+python desktop_app.py
+```
+
+## Bulk scan
+```bash
+python bulk_scan.py --input values.txt --output results.json
+```
+
+## Package the desktop app
+```bash
+python build_app.py
+```
+
+## Notes
+- API keys are optional.
+- The app can still function using public search fallback sources without keys.
+- This project is intended for lawful, ethical, and public-source research only.
