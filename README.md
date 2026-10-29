@@ -26,6 +26,21 @@ HISTORY_PATH = os.path.join(os.path.dirname(__file__), "history.json")
 st.set_page_config(page_title="Entity Intelligence", page_icon="🔎", layout="wide")
 
 
+SOURCE_WEIGHTS = {
+    "linkedin": 1.5,
+    "social": 1.25,
+    "institution": 1.35,
+    "search": 1.12,
+    "general": 0.9,
+}
+
+STOP_WORDS = {
+    "the", "this", "that", "search", "results", "page", "website", "about",
+    "contact", "support", "home", "login", "sign", "up", "news", "business",
+    "company", "site", "official", "welcome", "help", "services", "products"
+}
+
+
 def normalize_whitespace(value: str) -> str:
     return (value or "").strip()
 
@@ -119,7 +134,7 @@ def extract_domain_from_link(link: str) -> str:
 
 
 def get_source_label(domain: str) -> str:
-    d = domain.lower()
+    d = (domain or "").lower()
     if "linkedin" in d:
         return "linkedin"
     if "facebook" in d or "instagram" in d:
@@ -133,22 +148,27 @@ def get_source_label(domain: str) -> str:
     return "general"
 
 
+def get_source_weight(domain: str) -> float:
+    return SOURCE_WEIGHTS.get(get_source_label(domain), 0.9)
+
+
 def extract_entity_names(text: str) -> List[str]:
     cleaned = re.sub(r"https?://\S+", " ", text)
     cleaned = re.sub(r"\b(?:www\.|com|net|org|io|co|gov|edu)\b", " ", cleaned, flags=re.I)
-    titles = re.findall(r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}|[A-Z]{2,})\b", cleaned)
-    stop = {
-        "The", "This", "That", "Results", "Search", "Page", "Website", "About", "Contact",
-        "Support", "Home", "Login", "Sign", "Up", "Business", "Company", "Site", "News"
-    }
+    pattern = r"\b(?:[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}|[A-Z]{2,})\b"
+    titles = re.findall(pattern, cleaned)
     names = []
     seen = set()
     for item in titles:
-        if item in stop or len(item) < 2:
+        normalized = item.strip()
+        if len(normalized) < 2:
             continue
-        if item not in seen:
-            names.append(item)
-            seen.add(item)
+        lowered = normalized.lower()
+        if lowered in STOP_WORDS:
+            continue
+        if normalized not in seen:
+            names.append(normalized)
+            seen.add(normalized)
     return names[:8]
 
 
@@ -159,28 +179,32 @@ def rank_result(item: Dict[str, str], query: str) -> Dict[str, Any]:
     domain = extract_domain_from_link(link)
     text = f"{title} {snippet}".lower()
     q = normalize_whitespace(query).lower()
+
     score = 0
+    source_weight = get_source_weight(domain)
 
     if q and q in text:
         score += 30
     if q and q in title.lower():
-        score += 20
+        score += 22
     if q and q in domain.lower():
-        score += 15
+        score += 18
     if domain:
         score += 10
     if "linkedin.com" in domain:
-        score += 15
+        score += 18
     if "facebook.com" in domain:
-        score += 10
+        score += 12
     if any(k in text for k in ["support", "contact", "customer", "sales", "pricing", "business", "company", "account", "invoice"]):
         score += 8
     if any(k in title.lower() for k in ["contact", "support", "sales", "help", "customer", "pricing"]):
         score += 12
     if title:
-        score += 5
+        score += 6
     if snippet:
         score += 4
+
+    score = int(score * source_weight)
 
     return {
         "title": title,
@@ -309,9 +333,9 @@ def search_all(query: str, kind: str = "all", limit: int = 10, aggressive: bool 
     results: List[Dict[str, str]] = []
     seen = set()
     queries = build_search_queries(query, kind)
-    source_calls = [serpapi_search, google_cse_search, duckduckgo_search]
+    sources = [serpapi_search, google_cse_search, duckduckgo_search]
     for query_text in queries:
-        for source in source_calls:
+        for source in sources:
             source_limit = max(limit, 6) if aggressive else limit
             for item in source(query_text, limit=source_limit):
                 key = (item.get("title"), item.get("link"))
@@ -543,6 +567,43 @@ def build_risk_brief(raw: str, kind: str) -> Dict[str, Any]:
     return {"risk_level": level, "score": score, "signals": signals[:10]}
 
 
+def build_intelligence_profile(query: str, kind: str, results: List[Dict[str, Any]], likely_owner: List[str], likely_usage: List[str]) -> Dict[str, Any]:
+    entity_candidates = []
+    for item in results:
+        entity_candidates.extend(item.get("entity_names", []))
+    for owner in likely_owner:
+        entity_candidates.append(owner)
+    entity_candidates = [e for e in entity_candidates if e and len(e) > 2]
+    deduped = list(dict.fromkeys(entity_candidates))[:8]
+
+    domain_counts: Dict[str, int] = {}
+    for item in results:
+        domain = item.get("domain", "")
+        if domain:
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+    top_domains = sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    source_counts: Dict[str, int] = {}
+    for item in results:
+        source = item.get("source", "general")
+        source_counts[source] = source_counts.get(source, 0) + 1
+
+    profile = {
+        "top_entities": deduped,
+        "top_domains": [d for d, _ in top_domains],
+        "source_distribution": source_counts,
+        "query_type": kind,
+        "likely_name": deduped[0] if deduped else query,
+        "likely_company": deduped[1] if len(deduped) > 1 else deduped[0] if deduped else query,
+        "likely_use_case": likely_usage[0] if likely_usage else "Unknown",
+        "notes": [
+            "Public search signals suggest the strongest matches are from trusted domains and relevant source types.",
+            "The model prioritizes domains with stronger credibility and attaches relevance scores based on title/snippet overlap.",
+        ],
+    }
+    return profile
+
+
 def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[str, Any]:
     value = normalize_whitespace(raw)
     kind = detect_type(value) if category == "all" else category
@@ -551,8 +612,7 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
     if kind == "email":
         email = clean_email(value)
         result["email"] = email
-        query = f'"{email}"'
-        raw_results = search_all(query, kind="email", limit=10, aggressive=aggressive)
+        raw_results = search_all(f'"{email}"', kind="email", limit=10, aggressive=aggressive)
         result["search_results"] = raw_results
         result["likely_owner"] = guess_owner(raw_results)
         result["likely_usage"] = guess_usage(raw_results)
@@ -638,12 +698,38 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
 
     ranked = prepare_ranked_results(result["search_results"], value)
     result["ranked_results"] = ranked
-    result["summary"] = {
-        "top_domains": sorted({item.get("domain", "") for item in ranked if item.get("domain")})[:10],
-        "confidence": "high" if len(ranked) >= 3 and max((item.get("score", 0) for item in ranked), default=0) >= 30 else "medium" if ranked else "low",
-        "entities": list(dict.fromkeys([name for item in ranked for name in item.get("entity_names", [])]))[:8],
-    }
+    result["summary"] = build_intelligence_profile(value, kind, ranked, result["likely_owner"], result["likely_usage"])
+    confidence_value = max((item.get("score", 0) for item in ranked), default=0)
+    if len(ranked) >= 5 and confidence_value >= 80:
+        confidence = "high"
+    elif len(ranked) >= 2 and confidence_value >= 40:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    result["summary"]["confidence"] = confidence
     return result
+
+
+def render_mobile_css() -> None:
+    st.markdown(
+        """
+        <style>
+        .stApp { padding-bottom: 2rem; }
+        div[data-testid="stSidebar"] { background: #0f172a; }
+        @media (max-width: 768px) {
+            .block-container { padding: 0.8rem 0.75rem 1.5rem !important; }
+            h1 { font-size: 2rem !important; }
+            h2 { font-size: 1.4rem !important; }
+            h3 { font-size: 1.1rem !important; }
+            .stButton>button { width: 100%; }
+            .stTextInput input, .stTextArea textarea, .stSelectbox div, .stNumberInput input {
+                font-size: 1rem !important;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_summary_cards(data: Dict[str, Any]) -> None:
@@ -686,11 +772,40 @@ def render_result_card(item: Dict[str, Any]) -> None:
         )
 
 
+def render_intelligence_profile(data: Dict[str, Any]) -> None:
+    st.subheader("Intelligence profile")
+    profile = data.get("summary", {})
+    if not profile:
+        st.info("Not enough data to generate an intelligence profile.")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Likely identity**")
+        st.code(profile.get("likely_name", "Unknown"))
+        st.markdown("**Likely company**")
+        st.code(profile.get("likely_company", "Unknown"))
+    with col2:
+        st.markdown("**Likely use case**")
+        st.code(profile.get("likely_use_case", "Unknown"))
+        st.markdown("**Confidence**")
+        st.code(str(profile.get("confidence", "low")).title())
+
+    st.markdown("**Top entities**")
+    st.code(", ".join(profile.get("top_entities", [])) if profile.get("top_entities") else "No meaningful entities found.")
+
+    st.markdown("**Top domains**")
+    st.code(", ".join(profile.get("top_domains", [])) if profile.get("top_domains") else "No domains found.")
+
+    st.markdown("**Source distribution**")
+    st.json(profile.get("source_distribution", {}))
+
+    for note in profile.get("notes", []):
+        st.caption(note)
+
+
 def render_who_what_panel(data: Dict[str, Any]) -> None:
     st.subheader("Who / what is this?")
-    summary_entities = data.get("summary", {}).get("entities", [])
-    if summary_entities:
-        st.code(", ".join(summary_entities))
     if data.get("likely_owner"):
         st.markdown("Likely owner or brand clues:")
         st.code(", ".join(data["likely_owner"]))
@@ -765,9 +880,9 @@ def render_history_sidebar() -> None:
         return
     st.sidebar.subheader("Recent scans")
     for index, item in enumerate(history[:8]):
-        label = f"{item.get('value', 'unknown')}"
-        if st.sidebar.button(label, key=f"recent_{index}"):
-            st.session_state["search_input"] = item.get("value", "")
+        value = item.get("value", "")
+        if st.sidebar.button(value, key=f"recent_{index}"):
+            st.session_state["search_input"] = value
             st.session_state["category"] = item.get("category", "all")
             st.rerun()
 
@@ -798,11 +913,11 @@ def render_bulk_scan_ui() -> None:
                 results.append({"input": entry, "error": str(exc)})
         st.success(f"Finished bulk scan for {len(results)} record(s).")
         st.json(results)
-        bulk_df = pd.DataFrame(results)
         st.download_button("Download bulk JSON", data=json.dumps(results, indent=2, ensure_ascii=False).encode("utf-8"), file_name="bulk_results.json", mime="application/json")
 
 
 def main() -> None:
+    render_mobile_css()
     st.title("Entity Intelligence")
     st.caption("Search and analyze public data across people, companies, domains, phone numbers, emails, URLs, and numeric values.")
     render_history_sidebar()
@@ -831,16 +946,15 @@ def main() -> None:
 
         render_summary_cards(result)
         st.markdown("---")
+        render_intelligence_profile(result)
+        st.markdown("---")
         render_who_what_panel(result)
         st.markdown("---")
 
         st.subheader("Where does it appear?")
         domain_options = ["all"] + sorted({item.get("domain", "") for item in filtered if item.get("domain")})
         domain_filter = st.selectbox("Filter by domain", domain_options, index=0)
-        if domain_filter != "all":
-            visible = filter_ranked_results(filtered, min_score=min_score, domain_filter=domain_filter, source_filter=source_filter)
-        else:
-            visible = filter_ranked_results(filtered, min_score=min_score, domain_filter="all", source_filter=source_filter)
+        visible = filter_ranked_results(filtered, min_score=min_score, domain_filter=(domain_filter if domain_filter != "all" else "all"), source_filter=source_filter)
         if visible:
             for item in visible[:12]:
                 render_result_card(item)
