@@ -535,6 +535,25 @@ def run_scan(raw: str, category: str = "all", aggressive: bool = False) -> Dict[
     return result
 
 
+def render_result_card(item: Dict[str, str]) -> None:
+    title = item.get("title", "Untitled")
+    link = item.get("link", "")
+    snippet = item.get("snippet", "")
+    domain = extract_domain_from_link(link)
+
+    with st.container():
+        st.markdown(
+            f"""
+            <div style="border:1px solid #2d3b53; border-radius:12px; padding:12px 14px; margin-bottom:12px; background:#0f172a;">
+                <div style="font-size:13px; color:#93c5fd; margin-bottom:6px;">{domain}</div>
+                <div style="font-size:20px; font-weight:600; margin-bottom:6px;"><a href="{link}" target="_blank" style="color:#e2e8f0; text-decoration:none;">{title}</a></div>
+                <div style="font-size:14px; color:#cbd5e1; line-height:1.5;">{snippet}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 def render_summary_cards(data: Dict[str, Any]) -> None:
     st.subheader("Overview")
     col1, col2, col3, col4 = st.columns(4)
@@ -566,17 +585,17 @@ def render_who_what_panel(data: Dict[str, Any]) -> None:
         st.caption(data["wikipedia"].get("url", ""))
 
 
-def render_where_appears_panel(data: Dict[str, Any]) -> None:
+def render_where_appears_panel(data: Dict[str, Any], filter_by_domain: Optional[str] = None) -> None:
     st.subheader("Where does it appear?")
     results = data.get("search_results", [])
+    if filter_by_domain:
+        results = [item for item in results if filter_by_domain.lower() in extract_domain_from_link(item.get("link", "")).lower()]
+
     if results:
         for item in results[:12]:
-            st.markdown(f"### [{item.get('title', 'Untitled')}]({item.get('link', '')})")
-            st.caption(extract_domain_from_link(item.get("link", "")))
-            st.write(item.get("snippet", ""))
-            st.markdown("---")
+            render_result_card(item)
     else:
-        st.info("No public matches were found.")
+        st.info("No public matches were found for the selected filter.")
 
 
 def render_usage_panel(data: Dict[str, Any]) -> None:
@@ -639,6 +658,37 @@ def render_downloads(data: Dict[str, Any], input_value: str) -> None:
     )
 
 
+def render_bulk_scan_ui() -> None:
+    st.subheader("Bulk scan")
+    bulk_text = st.text_area("Paste values (one per line)", height=220, placeholder="+1 555 123 4567\nuser@example.com\nexample.com\nApple Inc.")
+    bulk_category = st.selectbox("Bulk category", ["all", "phone", "email", "domain", "url", "number"], index=0)
+    aggressive = st.toggle("Aggressive bulk search", value=False)
+    if st.button("Run bulk scan"):
+        entries = [line.strip() for line in bulk_text.splitlines() if line.strip()]
+        if not entries:
+            st.warning("Paste at least one value to scan.")
+            return
+
+        results = []
+        for entry in entries:
+            try:
+                item = run_scan(entry, category=bulk_category, aggressive=aggressive)
+                results.append({"input": entry, "type": item.get("type"), "risk": item.get("risk"), "likely_owner": item.get("likely_owner", []), "likely_usage": item.get("likely_usage", []), "public_results": item.get("search_results", [])[:5]})
+            except Exception as exc:  # pragma: no cover
+                results.append({"input": entry, "error": str(exc)})
+
+        st.success(f"Finished bulk scan for {len(results)} record(s).")
+        st.json(results)
+
+        df = pd.DataFrame(results)
+        st.download_button(
+            label="Download bulk results as JSON",
+            data=json.dumps(results, indent=2, ensure_ascii=False).encode("utf-8"),
+            file_name="bulk_results.json",
+            mime="application/json",
+        )
+
+
 def main() -> None:
     st.title("Entity Intelligence")
     st.caption("Search and analyze public data across people, companies, domains, phone numbers, emails, URLs, and numeric values.")
@@ -653,7 +703,10 @@ def main() -> None:
         aggressive = st.toggle("Aggressive search", value=False)
         st.info("Use aggressive mode to search more deeply and pull more results from public sources.")
 
+        all_domains = st.checkbox("Filter visible results by domain", value=False)
+
     search_input = st.text_input("Enter a value to scan", placeholder="e.g. 1234567890, +1 555 123 4567, example.com, user@example.com, @username, Apple Inc.")
+
     if st.button("Search"):
         if not search_input.strip():
             st.warning("Please enter a value.")
@@ -665,10 +718,19 @@ def main() -> None:
         render_summary_cards(result)
         st.markdown("---")
 
+        filter_domain = None
+        if all_domains and result.get("search_results"):
+            domains = sorted({extract_domain_from_link(item.get("link", "")) for item in result["search_results"] if extract_domain_from_link(item.get("link", ""))})
+            filter_domain = st.selectbox("Filter by domain", ["all"] + domains, index=0)
+            if filter_domain != "all":
+                filter_domain = filter_domain
+            else:
+                filter_domain = None
+
         render_who_what_panel(result)
         st.markdown("---")
 
-        render_where_appears_panel(result)
+        render_where_appears_panel(result, filter_by_domain=filter_domain)
         st.markdown("---")
 
         render_usage_panel(result)
@@ -684,6 +746,8 @@ def main() -> None:
         st.markdown("---")
 
         render_downloads(result, search_input)
+
+    render_bulk_scan_ui()
 
 
 if __name__ == "__main__":
